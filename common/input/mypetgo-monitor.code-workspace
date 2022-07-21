@@ -1,0 +1,21 @@
+{
+  "folders": [
+	{
+		"path": "../.."
+	},
+	{
+		"name": "test_led",
+		"path": "../../../../../Documents/PlatformIO/Projects/test_led"
+	}
+],
+  "settings": {
+    "files.associations": {
+      "esp_log.h": "c",
+      "gnss.h": "c",
+      "array": "c",
+      "string": "c",
+      "string_view": "c",
+      "define.h": "c"
+    }
+  }
+}
