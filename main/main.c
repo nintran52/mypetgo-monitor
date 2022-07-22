@@ -6,6 +6,7 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,6 +22,8 @@
 #include "lwip/sys.h"
 #include "define.h"
 #include "driver/gpio.h"
+#include "mqtt_client.h"
+#include <time.h>
 
 /* The examples use WiFi configuration that you can set via project configuration menu
 
@@ -41,14 +44,46 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 
-static const char *TAG = "wifi station";
-static const char *TAG_GPS = "GNSS";
+static const char *TAG = "Wifi =======================================";
+static const char *TAG_MQTT = "MQTT =======================================";
+static const char *TAG_GPS = "GNSS =======================================";
 
 static int s_retry_num = 0;
 
 static QueueHandle_t uart0_queue;
 #define BUF_SIZE (1024)
 bool f_response_at_cmd = false;
+
+size_t dataSize(const char *data)
+{
+    size_t length = 0;
+    while (data[length++])
+        ;
+    return length - 1;
+}
+
+struct Gps
+{
+    char time[17];
+    double latitude;
+    double longitude;
+    double altitude;
+    double spkm;
+    float snr;
+};
+
+static struct Gps gps_ = {
+    .time = {0},
+    .latitude = 0.000,
+    .longitude = 0.000,
+    .altitude = 0,
+    .spkm = 0.0,
+    .snr = 0.0,
+};
+
+float hdop_min = 2;
+
+esp_mqtt_client_handle_t client = NULL;
 
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
@@ -152,38 +187,70 @@ void wifi_init_sta(void)
     vEventGroupDelete(s_wifi_event_group);
 }
 
-static void parsedateTime(char *dateTime, char *data)
+/*
+ * @brief Event handler registered to receive MQTT events
+ *
+ *  This function is called by the MQTT client event loop.
+ *
+ * @param handler_args user data registered to the event.
+ * @param base Event base for the handler(always MQTT Base in this example).
+ * @param event_id The id for the received event.
+ * @param event_data The data for the event, esp_mqtt_event_handle_t.
+ */
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    dateTime[0] = data[0];
-    dateTime[1] = data[1];
-    dateTime[2] = ':';
-    dateTime[3] = data[2];
-    dateTime[4] = data[3];
-    dateTime[5] = ':';
-    dateTime[6] = data[4];
-    dateTime[7] = data[5];
+    ESP_LOGD(TAG_MQTT, "Event dispatched from event loop base=%s, event_id=%d", base, event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    client = event->client;
+    switch ((esp_mqtt_event_id_t)event_id)
+    {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_CONNECTED");
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_DISCONNECTED");
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_DATA");
+        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+        printf("DATA=%.*s\r\n", event->data_len, event->data);
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_ERROR");
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT)
+        {
+            ESP_LOGI(TAG_MQTT, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+        }
+        break;
+    default:
+        ESP_LOGI(TAG_MQTT, "Other event id:%d", event->event_id);
+        break;
+    }
 }
 
-struct Gps
+static void mqtt_app_start(void)
 {
-    char time[17];
-    double latitude;
-    double longitude;
-    double altitude;
-    double spkm;
-    float snr;
-};
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .uri = CONFIG_BROKER_URL,
+        .username = "username",
+        .password = "password",
+    };
 
-static struct Gps gps_ = {
-    .time = {0},
-    .latitude = 0.000,
-    .longitude = 0.000,
-    .altitude = 0,
-    .spkm = 0.0,
-    .snr = 0.0,
-};
-
-float hdop_min = 2;
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(client);
+}
 
 static double parseLatLon(char *data)
 {
@@ -193,66 +260,59 @@ static double parseLatLon(char *data)
     return (double)(data_int + decimal / 60);
 }
 
-static void gpsParse(char data[13][13], uint8_t size)
+char **str_split(char *a_str, const char a_delim)
 {
-    // ESP_LOGI(TAG_NET, "--Start parse GPS---");
-    double lat_temp = 0;
-    double lon_temp = 0;
-    char *token;
-    token = strtok(data[1], ".");
-    if (!token)
+    char **result = 0;
+    size_t count = 0;
+    char *tmp = a_str;
+    char *last_comma = 0;
+    char delim[2];
+    delim[0] = a_delim;
+    delim[1] = 0;
+
+    /* Count how many elements will be extracted. */
+    while (*tmp)
     {
-        return;
-    }
-    char time[8];
-    parsedateTime(time, token);
-    if (!memcmp(data[4], "N", 2))
-    {
-        lat_temp = parseLatLon(data[3]);
-    }
-    else if (!memcmp(data[4], "S", 2))
-    {
-        lat_temp = -parseLatLon(data[3]);
-    }
-    else
-    {
-        return;
-    }
-    if (size > 6)
-    {
-        if (!memcmp(data[6], "E", 2))
+        if (a_delim == *tmp)
         {
-            lon_temp = parseLatLon(data[5]);
+            count++;
+            last_comma = tmp;
         }
-        else if (!memcmp(data[6], "W", 2))
-        {
-            lon_temp = -parseLatLon(data[5]);
-        }
-        else
-        {
-            return;
-        }
+        tmp++;
     }
 
-    if (lat_temp != 0 && lon_temp != 0)
+    /* Add space for trailing token. */
+    count += last_comma < (a_str + strlen(a_str) - 1);
+
+    /* Add space for terminating null string so caller
+       knows where the list of returned strings ends. */
+    count++;
+
+    result = malloc(sizeof(char *) * count);
+
+    if (result)
     {
-        gps_.latitude = lat_temp;
-        gps_.longitude = lon_temp;
-        gps_.altitude = strtod("1", NULL);
-        gps_.spkm = strtod(data[7], NULL);
-        gps_.time[8] = ' ';
-        memcpy(gps_.time + 9, time, 8);
-        ESP_LOGI(TAG_GPS, "GPS Parse -> Lat :%f Long: %f Speed over ground: %f (Km/hr) Date: %s", gps_.latitude, gps_.longitude, gps_.spkm, gps_.time);
+        size_t idx = 0;
+        char *token = strtok(a_str, delim);
+
+        while (token)
+        {
+            assert(idx < count);
+            *(result + idx++) = strdup(token);
+            token = strtok(0, delim);
+        }
+        assert(idx == count - 1);
+        *(result + idx) = 0;
     }
-    return;
+
+    return result;
 }
 
 static void dataParse(const uint8_t *data, uint32_t size)
 {
     char dt[size];
     memcpy(dt, data, size);
-    char *tmp_str;
-    tmp_str = NULL;
+    char *tmp_str = NULL;
 
     tmp_str = strstr(dt, "$GPGSV");
     if (tmp_str)
@@ -281,177 +341,43 @@ static void dataParse(const uint8_t *data, uint32_t size)
         }
     }
 
-    // //$GNRMC,054515.00,A,1602.42256,N,10814.79274,E,0.0,,210722,1.1,W,A,V*68
-    // //$GPRMC,054518.00,A,1602.42209,N,10814.79374,E,0.0,,210722,1.1,W,A,V*70
-    // tmp_str = strstr(dt, "$GNRMC");
-    // if (tmp_str)
-    // {
-    //     // test
-    //     tmp_str = strtok(tmp_str, "\r\n");
-    //     if (!tmp_str)
-    //     {
-    //         return;
-    //     }
-    //     //$GNRMC,,V,,,,,,,,,,N,V*37
-
-    //     char *check_str = strstr(tmp_str, ",,");
-    //     if (check_str != NULL)
-    //     {
-    //         return;
-    //     }
-    //     ESP_LOGI(TAG_GPS, "gps receive %s", tmp_str);
-
-    //     // test
-    //     char gps_info[13][13] = {0};
-    //     uint8_t pos = 0;
-    //     char *pch = strchr(tmp_str, ',');
-    //     int _s = 0;
-    //     while (pch != NULL && pos < 13)
-    //     {
-    //         int len = pch - tmp_str + 1;
-    //         pch = strchr(pch + 1, ',');
-    //         memcpy(gps_info[pos], tmp_str + _s, len - _s - 1);
-    //         _s = len;
-    //         pos++;
-    //     }
-    //     if (pos > 4)
-    //     {
-    //         gpsParse(gps_info, pos);
-    //         return;
-    //     }
-    //     return;
-    // }
-
-    // tmp_str = strstr(dt, "$GPRMC");
-    // if (tmp_str)
-    // {
-    //     // test
-    //     tmp_str = strtok(tmp_str, "\r\n");
-    //     if (!tmp_str)
-    //     {
-    //         return;
-    //     }
-    //     //$GNRMC,,V,,,,,,,,,,N,V*37
-
-    //     char *check_str = strstr(tmp_str, ",,");
-    //     if (check_str != NULL)
-    //     {
-    //         return;
-    //     }
-    //     ESP_LOGI(TAG_GPS, "gps receive %s", tmp_str);
-
-    //     // test
-    //     char gps_info[13][13] = {0};
-    //     uint8_t pos = 0;
-    //     char *pch = strchr(tmp_str, ',');
-    //     int _s = 0;
-    //     while (pch != NULL && pos < 13)
-    //     {
-    //         int len = pch - tmp_str + 1;
-    //         pch = strchr(pch + 1, ',');
-    //         memcpy(gps_info[pos], tmp_str + _s, len - _s - 1);
-    //         _s = len;
-    //         pos++;
-    //     }
-    //     if (pos > 4)
-    //     {
-    //         gpsParse(gps_info, pos);
-    //         return;
-    //     }
-    //     return;
-    // }
-
-    // tmp_str = strstr(dt, "$GPGGA");
-    // if (tmp_str)
-    // {
-    //     tmp_str = strtok(tmp_str, "\r\n");
-    //     if (!tmp_str)
-    //     {
-    //         return;
-    //     }
-
-    //     char *check_str = strstr(tmp_str, ",,,,,");
-    //     if (check_str != NULL)
-    //     {
-    //         return;
-    //     }
-
-    //     ESP_LOGI(TAG_GPS, "gps receive: %s", tmp_str);
-
-    //     char gps_info[13][13] = {0};
-    //     uint8_t pos = 0;
-    //     char *pch = strchr(tmp_str, ',');
-    //     int _s = 0;
-    //     while (pch != NULL && pos < 13)
-    //     {
-    //         int len = pch - tmp_str + 1;
-    //         pch = strchr(pch + 1, ',');
-    //         memcpy(gps_info[pos], tmp_str + _s, len - _s - 1);
-    //         _s = len;
-    //         pos++;
-    //     }
-
-    //     if (pos > 7)
-    //     {
-    //         char *token;
-    //         token = strtok(gps_info[1], ".");
-    //         if (!token)
-    //         {
-    //             return;
-    //         }
-    //         float lat_temp = 0;
-    //         float lon_temp = 0;
-    //         if (!memcmp(gps_info[3], "N", 2))
-    //         {
-    //             lat_temp = parseLatLon(gps_info[2]);
-    //         }
-    //         else if (!memcmp(gps_info[3], "S", 2))
-    //         {
-    //             lat_temp = -parseLatLon(gps_info[2]);
-    //         }
-    //         else
-    //         {
-    //             return;
-    //         }
-
-    //         if (!memcmp(gps_info[5], "E", 2))
-    //         {
-    //             lon_temp = parseLatLon(gps_info[4]);
-    //         }
-    //         else if (!memcmp(gps_info[5], "W", 2))
-    //         {
-    //             lon_temp = -parseLatLon(gps_info[4]);
-    //         }
-    //         else
-    //         {
-    //             return;
-    //         }
-    //         float hdop = strtod(gps_info[8], NULL);
-    //         ESP_LOGI(TAG_GPS, "GPGGA HDOP level precision factor: %f", hdop);
-    //         if (hdop < hdop_min)
-    //         {
-    //             hdop_min = hdop;
-    //             gps_.latitude = lat_temp;
-    //             gps_.longitude = lon_temp;
-    //             gps_.altitude = strtod(gps_info[9], NULL);
-    //             char date[8] = {"dd:mm:yy"}; // default
-    //             memcpy(gps_.time, date, 8);
-    //             gps_.time[8] = ' ';
-    //             ESP_LOGI(TAG_GPS, "GPGGA Datetime: %s Lat :%f Long: %f Altitude: %f", gps_.time, gps_.latitude, gps_.longitude, gps_.altitude);
-    //         }
-    //         // altitude - mean-sea-level (geoid) inmeters
-    //     }
-    //     return;
-    // }
-
+    tmp_str = NULL;
     tmp_str = strstr(dt, "$GPSACP");
     if (tmp_str)
     {
-        ESP_LOGI(TAG_GPS, "GPS receive %s", tmp_str);
-        tmp_str = strtok(tmp_str, "\r\n");
-        if (!tmp_str)
+        ESP_LOGI(TAG_GPS, "FULL: %s", tmp_str);
+        if (strstr(tmp_str, "$GPSACP: "))
         {
-            return;
+            if (strstr(tmp_str, ",,,,,"))
+            {
+                return;
+            }
+
+            char *gnss = strchr(tmp_str, ': ');
+            strtok(gnss, "\r");
+            ESP_LOGI(TAG_GPS, "GNSS: %s", gnss);
+
+            char **gnssData = str_split(gnss, ',');
+            float hdop = strtod(*(gnssData + 3), NULL);
+            if (hdop <= 1)
+            {
+                ESP_LOGI(TAG_GPS, "Hdop: %f", hdop);
+                gps_.latitude = parseLatLon(*(gnssData + 1));
+                if (strstr(*(gnssData + 1), "W") != NULL)
+                {
+                    gps_.longitude = -parseLatLon(*(gnssData + 2));
+                }
+                else
+                {
+                    gps_.longitude = parseLatLon(*(gnssData + 2));
+                }
+                gps_.altitude = strtod(*(gnssData + 4), NULL);
+
+                char *pushData;
+                asprintf(&pushData, "%f|%f|%f", gps_.latitude, gps_.longitude, gps_.altitude);
+                ESP_LOGI(TAG_GPS, "Data: %s", pushData);
+                esp_mqtt_client_publish(client, "gnss", pushData, 0, 1, 0);
+            }
         }
     }
 }
@@ -483,7 +409,7 @@ static void uart_event_task(void *pvParameters)
                 break;
             // Event of HW FIFO overflow detected
             case UART_FIFO_OVF:
-                ESP_LOGI(TAG, "hw fifo overflow");
+                ESP_LOGI(TAG_GPS, "hw fifo overflow");
                 // If fifo overflow happened, you should consider adding flow control for your application.
                 // The ISR has already reset the rx FIFO,
                 // As an example, we directly flush the rx buffer here in order to read more data.
@@ -492,7 +418,7 @@ static void uart_event_task(void *pvParameters)
                 break;
             // Event of UART ring buffer full
             case UART_BUFFER_FULL:
-                ESP_LOGI(TAG, "ring buffer full");
+                ESP_LOGI(TAG_GPS, "ring buffer full");
                 // If buffer full happened, you should consider encreasing your buffer size
                 // As an example, we directly flush the rx buffer here in order to read more data.
                 uart_flush_input(EX_UART_NUM);
@@ -500,19 +426,19 @@ static void uart_event_task(void *pvParameters)
                 break;
             // Event of UART RX break detected
             case UART_BREAK:
-                ESP_LOGI(TAG, "uart rx break");
+                ESP_LOGI(TAG_GPS, "uart rx break");
                 break;
             // Event of UART parity check error
             case UART_PARITY_ERR:
-                ESP_LOGI(TAG, "uart parity error");
+                ESP_LOGI(TAG_GPS, "uart parity error");
                 break;
             // Event of UART frame error
             case UART_FRAME_ERR:
-                ESP_LOGI(TAG, "uart frame error");
+                ESP_LOGI(TAG_GPS, "uart frame error");
                 break;
             // Others
             default:
-                ESP_LOGI(TAG, "uart event type: %d", event.type);
+                ESP_LOGI(TAG_GPS, "uart event type: %d", event.type);
                 break;
             }
         }
@@ -520,14 +446,6 @@ static void uart_event_task(void *pvParameters)
     free(dtmp);
     dtmp = NULL;
     vTaskDelete(NULL);
-}
-
-size_t dataSize(const char *data)
-{
-    size_t length = 0;
-    while (data[length++])
-        ;
-    return length - 1;
 }
 
 // Default time out
@@ -556,12 +474,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+    ESP_LOGI(TAG, "Init");
     wifi_init_sta();
 
-    ESP_LOGI(TAG, "====================================");
-    esp_log_level_set(TAG, ESP_LOG_INFO);
+    ESP_LOGI(TAG_MQTT, "Init");
+    mqtt_app_start();
 
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    ESP_LOGI(TAG_GPS, "Init");
     /* Configure parameters of an UART driver,
      * communication pins and install the driver */
     uart_config_t uart_config = {
@@ -604,38 +524,36 @@ void app_main(void)
     // Create a task to handler UART event from ISR
     xTaskCreate(uart_event_task, "uart_event_task", 2048 * 2, NULL, 12, NULL);
 
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-
     int _gps_search = 0;
     while (!f_response_at_cmd && _gps_search <= 20)
     {
         ESP_LOGI(TAG, "Searching gps...%d", _gps_search);
         send_command("AT");
-        vTaskDelay(3000 / portTICK_PERIOD_MS);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
         _gps_search++;
     }
     send_command("AT+CMEE=2");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     send_command("AT$GPSCFG?");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     send_command("AT$GPSCFG=0,0");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     send_command("AT$GPSCFG=2,1");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     send_command("AT$GPSCFG=3,0");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     send_command("AT$GPSP=1");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     send_command("AT$GPSNMUNEX=0,1,1,0,0,0,0,0,0,0,0,1,0");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     // AT$GPSNMUN=<enable>[,<GGA>,<GLL>,<GSA>,<GSV>,<RMC>,<VTG>]
     send_command("AT$GPSNMUN=2,1,0,1,1,1,0");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     int _gps_call = 0;
     while (1)
     {
         send_command("AT$GPSACP");
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        vTaskDelay(4000 / portTICK_PERIOD_MS);
         _gps_call++;
     }
 }
