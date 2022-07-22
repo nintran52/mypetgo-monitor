@@ -23,7 +23,8 @@
 #include "define.h"
 #include "driver/gpio.h"
 #include "mqtt_client.h"
-#include <time.h>
+#include "math.h"
+#include "cJSON.h"
 
 /* The examples use WiFi configuration that you can set via project configuration menu
 
@@ -64,21 +65,17 @@ size_t dataSize(const char *data)
 
 struct Gps
 {
-    char time[17];
     double latitude;
     double longitude;
     double altitude;
-    double spkm;
-    float snr;
+    char time[17];
 };
 
 static struct Gps gps_ = {
-    .time = {0},
     .latitude = 0.000,
     .longitude = 0.000,
-    .altitude = 0,
-    .spkm = 0.0,
-    .snr = 0.0,
+    .altitude = 0.0,
+    .time = {0},
 };
 
 float hdop_min = 2;
@@ -241,7 +238,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 static void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
-        .uri = CONFIG_BROKER_URL,
+        .host = "34.143.181.141",
+        .port = 1883,
         .username = "username",
         .password = "password",
     };
@@ -308,6 +306,77 @@ char **str_split(char *a_str, const char a_delim)
     return result;
 }
 
+static struct tm getTimeValue()
+{
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    return timeinfo;
+}
+
+static char *getTimeString()
+{
+    struct tm timeinfo = getTimeValue();
+    static char strftime_buf[BUF_SIZE_32] = {0};
+    strftime(strftime_buf, sizeof(strftime_buf), "%FT%XZ", &timeinfo);
+    // ESP_LOGI(TAG, "The current date/time: %s", strftime_buf);
+    return strftime_buf;
+}
+
+double round_up(double value, int decimal_places)
+{
+    const double multiplier = pow(10.0, decimal_places);
+    return ceil(value * multiplier) / multiplier;
+}
+
+static const char *create_json_pet_info()
+{
+    cJSON *root_health = cJSON_CreateObject();
+    cJSON *data;
+    cJSON *header_temp;
+
+    cJSON_AddItemToObject(root_health, "header", header_temp = cJSON_CreateObject());
+
+    // Get Mac
+    uint8_t mac_num[6] = {0};
+    char mac_str[18] = {0};
+    esp_efuse_mac_get_default(mac_num);
+    sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
+            mac_num[0], mac_num[1], mac_num[2], mac_num[3], mac_num[4], mac_num[5]);
+    cJSON_AddStringToObject(header_temp, "id", mac_str);
+
+    cJSON_AddItemToObject(root_health, "data", data = cJSON_CreateObject());
+
+    cJSON_AddNumberToObject(data, "tmp", 38.5);
+    cJSON_AddNumberToObject(data, "env", 28.5);
+    cJSON_AddNumberToObject(data, "bat", 69);
+
+    cJSON_AddNumberToObject(data, "lat", round_up(gps_.latitude, 6));
+    cJSON_AddNumberToObject(data, "lon", round_up(gps_.longitude, 6));
+    cJSON_AddNumberToObject(data, "alt", gps_.altitude);
+
+    char *date_time = getTimeString();
+    char *ptr = strchr(date_time, 'T');
+    if (ptr)
+    {
+        int index_time_ = ptr - date_time;
+        ESP_LOGI(TAG, "%s; Index T:%d; GPS datetime:%s", date_time, index_time_, gps_.time);
+        ptr = strchr(gps_.time, ' ');
+        if (ptr)
+        {
+            int index_time_gps = ptr - gps_.time;
+            strncpy(date_time + index_time_ + 1, gps_.time + index_time_gps + 1, 8);
+            ESP_LOGI(TAG, "After Replace date time:%s", date_time);
+        }
+    }
+    cJSON_AddStringToObject(header_temp, "dat", date_time);
+    char *_str = cJSON_Print(root_health);
+    cJSON_Minify(_str);
+    cJSON_Delete(root_health);
+    return _str;
+}
+
 static void dataParse(const uint8_t *data, uint32_t size)
 {
     char dt[size];
@@ -359,7 +428,7 @@ static void dataParse(const uint8_t *data, uint32_t size)
 
             char **gnssData = str_split(gnss, ',');
             float hdop = strtod(*(gnssData + 3), NULL);
-            if (hdop <= 1)
+            if (hdop <= 1.5)
             {
                 ESP_LOGI(TAG_GPS, "Hdop: %f", hdop);
                 gps_.latitude = parseLatLon(*(gnssData + 1));
@@ -373,10 +442,10 @@ static void dataParse(const uint8_t *data, uint32_t size)
                 }
                 gps_.altitude = strtod(*(gnssData + 4), NULL);
 
-                char *pushData;
-                asprintf(&pushData, "%f|%f|%f", gps_.latitude, gps_.longitude, gps_.altitude);
-                ESP_LOGI(TAG_GPS, "Data: %s", pushData);
-                esp_mqtt_client_publish(client, "gnss", pushData, 0, 1, 0);
+                const char *petData = NULL;
+                petData = create_json_pet_info();
+                ESP_LOGI(TAG_GPS, "Data created");
+                esp_mqtt_client_publish(client, "pet", petData, 0, 1, 0);
             }
         }
     }
@@ -553,7 +622,7 @@ void app_main(void)
     while (1)
     {
         send_command("AT$GPSACP");
-        vTaskDelay(4000 / portTICK_PERIOD_MS);
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
         _gps_call++;
     }
 }

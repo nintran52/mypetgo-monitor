@@ -6,6 +6,7 @@
 
 #define EX_UART_NUM UART_NUM_2
 
+#define BUF_SIZE_32 (32)
 #define BUF_SIZE_1024 (1024)
 #define RD_BUF_SIZE (BUF_SIZE_1024)
 
