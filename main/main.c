@@ -445,7 +445,7 @@ static void dataParse(const uint8_t *data, uint32_t size)
                 const char *petData = NULL;
                 petData = create_json_pet_info();
                 ESP_LOGI(TAG_GPS, "Data created");
-                esp_mqtt_client_publish(client, "pet", petData, 0, 1, 0);
+                esp_mqtt_client_publish(client, "pet-test", petData, 0, 1, 0);
             }
         }
     }
